@@ -73,6 +73,19 @@ export function PomodoroTimer({
     }
   });
 
+  // Precise wall-clock target timestamp ref to eliminate background tab timer drift
+  const endTimeRef = useRef<number | null>(null);
+  const currentSessionTaskRef = useRef(currentSessionTask);
+  const defaultTimeRef = useRef(defaultTime);
+
+  useEffect(() => {
+    currentSessionTaskRef.current = currentSessionTask;
+  }, [currentSessionTask]);
+
+  useEffect(() => {
+    defaultTimeRef.current = defaultTime;
+  }, [defaultTime]);
+
   useEffect(() => {
     safeLocalStorageSetItem('focus_tasks', JSON.stringify(tasks));
   }, [tasks]);
@@ -157,32 +170,115 @@ export function PomodoroTimer({
     }
   }, [soundEnabled]);
 
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval> | undefined = undefined;
-    if (isTimerRunning && timeLeft > 0) {
-      interval = setInterval(() => {
-        setTimeLeft((prev) => prev - 1);
-      }, 1000);
-    } else if (timeLeft === 0 && isTimerRunning) {
+  // High precision synchronization based on wall-clock time to prevent background tab drift
+  const syncTimer = useCallback(() => {
+    if (endTimeRef.current === null) return;
+    const now = Date.now();
+    const diffMs = endTimeRef.current - now;
+    const remaining = Math.max(0, Math.ceil(diffMs / 1000));
+
+    if (remaining <= 0) {
+      endTimeRef.current = null;
+      setTimeLeft(0);
       setIsTimerRunning(false);
       setHasStarted(false);
       setSessions(s => s + 1);
       playNotificationSound();
-      onTimerComplete(currentSessionTask || 'General Focus', defaultTime);
+      onTimerComplete(currentSessionTaskRef.current || 'General Focus', defaultTimeRef.current);
       setCurrentSessionTask('');
+    } else {
+      setTimeLeft(remaining);
+    }
+  }, [setIsTimerRunning, playNotificationSound, onTimerComplete]);
+
+  // Main countdown engine using Web Worker + interval + visibilitychange
+  useEffect(() => {
+    if (!isTimerRunning) {
+      return;
+    }
+
+    if (endTimeRef.current === null) {
+      endTimeRef.current = Date.now() + timeLeft * 1000;
+    }
+
+    let worker: Worker | null = null;
+    let fallbackInterval: ReturnType<typeof setInterval> | null = null;
+
+    // Web Worker intervals are not throttled by browsers when the tab is placed in the background
+    try {
+      const workerBlob = new Blob([
+        `let timer = null;
+        self.onmessage = function(e) {
+          if (e.data === 'start') {
+            if (!timer) {
+              timer = setInterval(function() {
+                self.postMessage('tick');
+              }, 500);
+            }
+          } else if (e.data === 'stop') {
+            if (timer) {
+              clearInterval(timer);
+              timer = null;
+            }
+          }
+        };`
+      ], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(workerBlob);
+      worker = new Worker(workerUrl);
+      worker.onmessage = () => {
+        syncTimer();
+      };
+      worker.postMessage('start');
+    } catch (e) {
+      console.warn('[Timer] Web Worker background tick unavailable, falling back to window interval:', e);
+    }
+
+    // Secondary window interval fallback
+    fallbackInterval = setInterval(() => {
+      syncTimer();
+    }, 500);
+
+    // Instantly catch up to the exact real-world second as soon as the user switches back to this tab
+    const handleVisibilityOrFocus = () => {
+      syncTimer();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('focus', handleVisibilityOrFocus);
+
+    return () => {
+      if (worker) {
+        worker.postMessage('stop');
+        worker.terminate();
+      }
+      if (fallbackInterval) {
+        clearInterval(fallbackInterval);
+      }
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+    };
+  }, [isTimerRunning, syncTimer]);
+
+  // Keep browser tab title updated in real time so the user can observe progress from other tabs
+  useEffect(() => {
+    if (isTimerRunning && timeLeft > 0) {
+      const mins = Math.floor(timeLeft / 60);
+      const secs = timeLeft % 60;
+      document.title = `(${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}) SYNCHRONY Focus Room`;
+    } else {
+      document.title = 'SYNCHRONY Focus Room';
     }
     return () => {
-      if (interval !== undefined) {
-        clearInterval(interval);
-      }
+      document.title = 'SYNCHRONY Focus Room';
     };
-  }, [isTimerRunning, timeLeft, setIsTimerRunning, onTimerComplete, currentSessionTask, defaultTime, playNotificationSound]);
+  }, [isTimerRunning, timeLeft]);
 
   const presetTimer = (minutes: number) => {
     const sec = minutes * 60;
     setDefaultTime(sec);
     setTimeLeft(sec);
     setIsTimerRunning(false);
+    endTimeRef.current = null;
     setHasStarted(false);
     setCurrentSessionTask('');
   };
@@ -195,15 +291,22 @@ export function PomodoroTimer({
       setCurrentSessionTask(taskName);
       setHasStarted(true);
     }
+    endTimeRef.current = Date.now() + timeLeft * 1000;
     setIsTimerRunning(true);
   };
 
   const handlePause = () => {
     setIsTimerRunning(false);
+    if (endTimeRef.current !== null) {
+      const remaining = Math.max(0, Math.ceil((endTimeRef.current - Date.now()) / 1000));
+      setTimeLeft(remaining);
+      endTimeRef.current = null;
+    }
   };
 
   const handleReset = () => {
     setIsTimerRunning(false);
+    endTimeRef.current = null;
     setTimeLeft(defaultTime);
     setHasStarted(false);
     setCurrentSessionTask('');
