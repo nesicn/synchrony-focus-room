@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, Pause, RotateCcw, X, Volume2, VolumeX } from 'lucide-react';
+import { Play, Pause, RotateCcw, X, Volume2, VolumeX, BookOpen, Tag } from 'lucide-react';
 import { ThemeConfig } from '../theme';
+import { useAcademic } from '../context/AcademicContext';
+import { EisenhowerChecklist } from './FocusChecklist/EisenhowerChecklist';
+import { TaskItem, EisenhowerQuadrant } from '../types/academic';
 
 // Local storage write protector
 const safeLocalStorageSetItem = (key: string, value: string) => {
@@ -20,7 +23,13 @@ const generateUUID = (): string => {
 };
 
 interface PomodoroTimerProps {
-  onTimerComplete: (task: string, durationSeconds: number) => void;
+  onTimerComplete: (
+    task: string, 
+    durationSeconds: number, 
+    courseId?: string, 
+    courseName?: string, 
+    courseColor?: string
+  ) => void;
   onTimerStart: (goal: string) => void;
   isTimerRunning: boolean;
   setIsTimerRunning: (isRunning: boolean) => void;
@@ -36,15 +45,30 @@ export function PomodoroTimer({
 }: PomodoroTimerProps) {
   const [defaultTime, setDefaultTime] = useState(25 * 60);
   const [timeLeft, setTimeLeft] = useState(25 * 60);
-  const [tasks, setTasks] = useState<{id: string, text: string, completed: boolean}[]>(() => {
+  const [tasks, setTasks] = useState<TaskItem[]>(() => {
     try {
       const saved = localStorage.getItem('focus_tasks');
-      return saved ? JSON.parse(saved) : [];
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return parsed.map((item: any) => ({
+            id: item.id || generateUUID(),
+            text: item.text || '',
+            completed: !!item.completed,
+            quadrant: (item.quadrant as EisenhowerQuadrant) || 'q1',
+            courseId: item.courseId || undefined,
+            createdAt: item.createdAt || new Date().toISOString(),
+          }));
+        }
+      }
+      return [];
     } catch (e) {
       console.error('Failed to parse focus tasks from storage:', e);
       return [];
     }
   });
+  const [activeFocusTaskId, setActiveFocusTaskId] = useState<string | null>(null);
+
   const [sessions, setSessions] = useState(() => {
     try {
       const saved = localStorage.getItem('focus_sessions');
@@ -55,7 +79,6 @@ export function PomodoroTimer({
       return 1;
     }
   });
-  const [newTask, setNewTask] = useState('');
   const [hasStarted, setHasStarted] = useState(false);
   const [currentSessionTask, setCurrentSessionTask] = useState(() => {
     try {
@@ -73,10 +96,17 @@ export function PomodoroTimer({
     }
   });
 
+  const { courses, selectedCourseIdForTimer, setSelectedCourseIdForTimer, selectedCourseForTimer } = useAcademic();
+
   // Precise wall-clock target timestamp ref to eliminate background tab timer drift
   const endTimeRef = useRef<number | null>(null);
   const currentSessionTaskRef = useRef(currentSessionTask);
   const defaultTimeRef = useRef(defaultTime);
+  const selectedCourseRef = useRef(selectedCourseForTimer);
+
+  useEffect(() => {
+    selectedCourseRef.current = selectedCourseForTimer;
+  }, [selectedCourseForTimer]);
 
   useEffect(() => {
     currentSessionTaskRef.current = currentSessionTask;
@@ -102,11 +132,16 @@ export function PomodoroTimer({
     safeLocalStorageSetItem('focus_sound_enabled', soundEnabled.toString());
   }, [soundEnabled]);
 
-  const handleAddTask = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && newTask.trim()) {
-      setTasks(prevTasks => [...prevTasks, { id: generateUUID(), text: newTask.trim(), completed: false }]);
-      setNewTask('');
-    }
+  const handleAddTask = (text: string, quadrant: EisenhowerQuadrant, courseId?: string) => {
+    const newTaskItem: TaskItem = {
+      id: generateUUID(),
+      text,
+      completed: false,
+      quadrant,
+      courseId,
+      createdAt: new Date().toISOString(),
+    };
+    setTasks(prev => [newTaskItem, ...prev]);
   };
 
   const toggleTask = (id: string) => {
@@ -120,6 +155,17 @@ export function PomodoroTimer({
 
   const deleteTask = (id: string) => {
     setTasks(prevTasks => prevTasks.filter(t => t.id !== id));
+    if (activeFocusTaskId === id) {
+      setActiveFocusTaskId(null);
+    }
+  };
+
+  const handleFocusTask = (task: TaskItem) => {
+    setActiveFocusTaskId(task.id);
+    setCurrentSessionTask(task.text);
+    if (task.courseId) {
+      setSelectedCourseIdForTimer(task.courseId);
+    }
   };
 
   const playNotificationSound = useCallback(() => {
@@ -184,12 +230,22 @@ export function PomodoroTimer({
       setHasStarted(false);
       setSessions(s => s + 1);
       playNotificationSound();
-      onTimerComplete(currentSessionTaskRef.current || 'General Focus', defaultTimeRef.current);
+      const currentCourse = selectedCourseRef.current;
+      onTimerComplete(
+        currentSessionTaskRef.current || (currentCourse ? `${currentCourse.code} Çalışması` : 'General Focus'),
+        defaultTimeRef.current,
+        currentCourse?.id,
+        currentCourse?.code,
+        currentCourse?.color
+      );
+      if (activeFocusTaskId) {
+        setTasks(prev => prev.map(t => t.id === activeFocusTaskId ? { ...t, completed: true } : t));
+      }
       setCurrentSessionTask('');
     } else {
       setTimeLeft(remaining);
     }
-  }, [setIsTimerRunning, playNotificationSound, onTimerComplete]);
+  }, [setIsTimerRunning, playNotificationSound, onTimerComplete, activeFocusTaskId]);
 
   // Main countdown engine using Web Worker + interval + visibilitychange
   useEffect(() => {
@@ -285,7 +341,14 @@ export function PomodoroTimer({
 
   const handleStart = () => {
     const activeTasks = tasks.filter(t => !t.completed).map(t => t.text).join(', ');
-    const taskName = activeTasks || 'General Focus';
+    const activeCourse = selectedCourseForTimer;
+    let taskName = activeTasks;
+    if (!taskName) {
+      taskName = activeCourse ? `${activeCourse.code} Çalışması` : 'General Focus';
+    } else if (activeCourse && !taskName.includes(activeCourse.code)) {
+      taskName = `${activeCourse.code}: ${taskName}`;
+    }
+
     if (!hasStarted) {
       onTimerStart(taskName);
       setCurrentSessionTask(taskName);
@@ -324,17 +387,75 @@ export function PomodoroTimer({
   return (
     <div className="flex flex-col gap-6 h-full w-full">
       {/* Timer Card */}
-      <div className={`flex-1 rounded-3xl p-6 md:p-10 flex flex-col items-center justify-center relative overflow-hidden min-h-[300px] transition-colors duration-500 border ${t.cardBg} ${t.border} ${t.shadow}`}>
+      <div className={`flex-1 rounded-3xl p-6 md:p-10 flex flex-col items-center justify-center relative overflow-hidden min-h-[340px] transition-colors duration-500 border ${t.cardBg} ${t.border} ${t.shadow}`}>
         
-        {/* Sound Toggle */}
-        <button
-          onClick={() => setSoundEnabled(!soundEnabled)}
-          className={`absolute top-6 right-6 p-2 rounded-xl transition-all border bg-transparent opacity-60 hover:opacity-100 ${t.border} ${t.primaryText} hover:bg-opacity-10`}
-          aria-label={soundEnabled ? "Mute notification sound" : "Enable notification sound"}
-        >
-          {soundEnabled ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
-        </button>
+        {/* Top Right Controls: Sessions Counter + Sound Toggle */}
+        <div className="absolute top-6 right-6 flex items-center gap-2">
+          <div className={`px-2.5 py-1.5 rounded-xl border text-xs font-mono font-bold flex items-center gap-1 opacity-75 ${t.border} ${t.primaryText}`}>
+            <span className="text-[10px] font-sans font-semibold uppercase opacity-60">Oturum:</span>
+            <span>{sessions.toString().padStart(2, '0')}</span>
+          </div>
 
+          {/* Sound Toggle */}
+          <button
+            onClick={() => setSoundEnabled(!soundEnabled)}
+            className={`p-2 rounded-xl transition-all border bg-transparent opacity-60 hover:opacity-100 ${t.border} ${t.primaryText} hover:bg-opacity-10`}
+            aria-label={soundEnabled ? "Mute notification sound" : "Enable notification sound"}
+          >
+            {soundEnabled ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
+          </button>
+        </div>
+
+        {/* Course Tag Selector (Takvim Entegrasyonu: Ders Renkleri ve İsimleri) */}
+        <div className="flex flex-wrap items-center justify-center gap-1.5 mb-6 max-w-xl z-10">
+          <div className={`flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider opacity-60 mr-1 ${t.secondaryText}`}>
+            <Tag className="w-3 h-3" />
+            <span>Ders:</span>
+          </div>
+
+          <button
+            onClick={() => setSelectedCourseIdForTimer(null)}
+            className={`px-3 py-1 rounded-xl text-xs font-semibold border transition-all ${
+              !selectedCourseIdForTimer
+                ? `${t.accentTargetBg} ${t.accentTargetText} border-transparent shadow-xs`
+                : `border-transparent ${t.inputBox} opacity-70 hover:opacity-100 ${t.primaryText}`
+            }`}
+          >
+            Genel Odaklanma
+          </button>
+
+          {courses.map((course) => {
+            const isSelected = selectedCourseIdForTimer === course.id;
+            return (
+              <button
+                key={course.id}
+                onClick={() => setSelectedCourseIdForTimer(course.id)}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-semibold border transition-all ${
+                  isSelected
+                    ? 'shadow-xs font-bold'
+                    : `border-transparent ${t.inputBox} opacity-70 hover:opacity-100`
+                }`}
+                style={
+                  isSelected
+                    ? {
+                        backgroundColor: `${course.color}20`,
+                        borderColor: course.color,
+                        color: course.color,
+                      }
+                    : undefined
+                }
+              >
+                <span
+                  className="w-2.5 h-2.5 rounded-full shrink-0 shadow-xs"
+                  style={{ backgroundColor: course.color }}
+                />
+                <span className={isSelected ? '' : t.primaryText}>{course.code}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Big Time Display */}
         <div className={`text-[80px] sm:text-[100px] lg:text-[144px] font-light font-mono tracking-tighter leading-none transition-colors duration-500 ${t.primaryText}`}>
           {minutes.toString().padStart(2, '0')}:{seconds.toString().padStart(2, '0')}
         </div>
@@ -408,60 +529,18 @@ export function PomodoroTimer({
         </div>
       </div>
 
-      {/* Stats & Task Info */}
-      <div className="h-auto md:h-48 flex flex-col md:flex-row gap-6 shrink-0 mt-2">
-        <div className={`flex-[2] rounded-3xl p-8 flex flex-col min-h-[160px] max-h-72 overflow-hidden transition-colors duration-500 border ${t.cardBg} ${t.border} ${t.shadow}`}>
-          <div className="flex items-center justify-between mb-4">
-            <span className={`text-xs font-bold uppercase tracking-widest transition-colors ${t.secondaryText}`}>Focus Checklist</span>
-            {tasks.length > 0 && <span className={`text-[10px] font-bold transition-colors ${t.secondaryText}`}>{tasks.filter(task => task.completed).length}/{tasks.length}</span>}
-          </div>
-          <div className="flex-1 overflow-y-auto mb-4 space-y-3 pr-2 custom-scrollbar">
-            {tasks.map(task => (
-              <div key={task.id} className="flex items-start gap-3 group">
-                <div 
-                  onClick={() => toggleTask(task.id)}
-                  className={`mt-0.5 w-5 h-5 rounded shrink-0 transition-colors border cursor-pointer flex items-center justify-center shadow-sm ${t.accentBorder} ${task.completed ? t.accentTargetBg : 'bg-transparent'}`}
-                >
-                  {task.completed && <svg className={`w-3.5 h-3.5 ${t.accentTargetText}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>}
-                </div>
-                <span className={`text-[15px] flex-1 transition-colors leading-snug ${
-                  task.completed 
-                    ? `line-through ${t.secondaryText} opacity-50`
-                    : `${t.primaryText} font-medium`
-                }`}>
-                  {task.text}
-                </span>
-                <button
-                  onClick={() => deleteTask(task.id)}
-                  className={`opacity-0 group-hover:opacity-100 transition-opacity focus:opacity-100 ${t.secondaryText} hover:opacity-80 p-1`}
-                  aria-label="Delete task"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            ))}
-            {tasks.length === 0 && <span className={`text-[15px] italic mt-2 block transition-colors ${t.secondaryText}`}>No tasks yet. Type below.</span>}
-          </div>
-          <input
-            type="text"
-            placeholder="Type a focus task and hit Enter..."
-            disabled={hasStarted}
-            value={newTask}
-            onChange={(e) => setNewTask(e.target.value)}
-            onKeyDown={handleAddTask}
-            className={`text-[15px] font-medium outline-none bg-transparent w-full disabled:opacity-75 focus:outline-none mb-4 transition-colors ${t.primaryText} placeholder:opacity-50`}
-          />
-          <div className={`w-full h-1.5 rounded-full overflow-hidden shrink-0 transition-colors ${t.ringBg}`}>
-            <div 
-              className={`h-full transition-all duration-500 ease-in-out ${t.accentTargetBg}`} 
-              style={{ width: `${checklistProgress}%` }} 
-            />
-          </div>
-        </div>
-        <div className={`w-full md:w-48 rounded-3xl p-8 flex flex-col items-center justify-center shrink-0 min-h-[140px] md:min-h-0 transition-all duration-500 border ${t.cardBg} ${t.border} ${t.shadow}`}>
-          <span className={`text-xs font-bold uppercase tracking-widest transition-colors ${t.secondaryText}`}>Sessions</span>
-          <div className={`text-5xl font-semibold mt-4 tracking-tight ${t.primaryText}`}>{sessions.toString().padStart(2, '0')}</div>
-        </div>
+      {/* Advanced Focus Checklist & Eisenhower Matrix */}
+      <div className="w-full mt-2">
+        <EisenhowerChecklist
+          tasks={tasks}
+          onAddTask={handleAddTask}
+          onToggleTask={toggleTask}
+          onDeleteTask={deleteTask}
+          onFocusTask={handleFocusTask}
+          activeFocusTaskId={activeFocusTaskId}
+          courses={courses}
+          t={t}
+        />
       </div>
     </div>
   );
